@@ -4,7 +4,7 @@ import sys
 import google.generativeai as genai2
 from google.genai import types
 from google import genai
-from instructions import first_agent, describer_agent, coding_agent, reviewer_agent
+from instructions import first_agent, describer_agent, coding_agent, reviewer_agent, effects_agent
 from utils import convert_text_to_dict, parse_enhancements_to_dict
 from dotenv import load_dotenv
 from math import radians
@@ -430,7 +430,6 @@ def review_scene_with_images(reviewer_agent, scene_description, screenshot_paths
 
     return review_text
 
-
 def send_to_blender(script_code):
     """
     Connects to the Blender MCP server, sends a script, and returns the response,
@@ -753,32 +752,153 @@ if __name__ == "__main__":
 
     print("\n🎬 All scene descriptions processed.")
 
+    flag = True
+    while flag:
     # Extract and process Key Elements section
-    section = extract_key_elements_section(response.text)
-    if section:
-        elements = get_all_elements(section)
-        print(f"\n--- Processing {len(elements)} Key Elements ---")
-        
-        max_retries = 1
-        for i, (category, element_name, description) in enumerate(elements, 1):
-            print(f"\n--- Processing Element {i}/{len(elements)}: {element_name} ---")
-            print(f"Category: {category}")
-            print(f"Description: {description[:100]}...")
+        section = extract_key_elements_section(response.text)
+        if section:
+            elements = get_all_elements(section)
+            print(f"\n--- Processing {len(elements)} Key Elements ---")
+            
+            max_retries = 1
+            for i, (category, element_name, description) in enumerate(elements, 1):
+                print(f"\n--- Processing Element {i}/{len(elements)}: {element_name} ---")
+                print(f"Category: {category}")
+                print(f"Description: {description[:100]}...")
 
-            # Get current scene context before processing each element
+                # Get current scene context before processing each element
+                print("Getting current scene context...")
+                current_scene_context = get_scene_context()
+
+                element_prompt = f"""
+        Category: {category}
+        Element: {element_name}
+        Description: {description}
+
+        Generate Blender code to create this specific element within the overall scene context.
+        Consider the existing objects and position this element appropriately.
+        """
+
+                retries = 0
+                previous_error = None
+                previous_code = None
+                
+                while retries <= max_retries:
+                    try:
+                        # Prepare the prompt based on whether this is a retry
+                        if retries == 0:
+                            # First attempt - use element description with context
+                            prompt = element_prompt
+                        else:
+                            # Retry attempt - include previous error and code for context
+                            prompt = f"""
+                            Original element description:
+                            Category: {category}
+                            Element: {element_name}
+                            Description: {description}
+                            
+                            Previous code that failed:
+                            ```
+                            {previous_code}
+                            ```
+                            
+                            Error received from Blender:
+                            {previous_error}
+                            
+                            Important: Do not use the attribute or method that caused the error mentioned above.
+                            Generate corrected code that avoids this specific error while still fulfilling the original element description.
+                            """
+                        
+                        # Generate code for this specific element with scene context
+                        generated_code = generate(coding_agent, prompt, current_scene_context)
+                        generated_code = generated_code[10:-4]  # Trim the response as in original code
+
+                        print("Generated code for element:")
+                        print(generated_code)
+
+                        print(f"\n--- Generated Blender Script for {element_name} ---")
+                        print("------------------------------\n")
+
+                        # Send to Blender
+                        blender_response = send_to_blender(generated_code)
+                        print("Blender response:", blender_response)
+
+                        # Check if successful
+                        is_successful = False
+
+                        if blender_response and blender_response.get("status") == "success":
+                            is_successful = True
+
+                        if is_successful:
+                            print(f"✅ {element_name} script executed successfully and completely in Blender!")
+                            # Update scene context after successful execution
+                            current_scene_context = get_scene_context()
+                            break  # Exit retry loop when successful
+                        else:
+                            # Store the error and code for the next retry
+                            previous_error = get_error_details(blender_response)
+                            previous_code = generated_code
+                            
+                            retries += 1
+                            if retries <= max_retries:
+                                print(f"❌ {element_name} script failed or was incomplete. Attempt {retries}/{max_retries + 1}. Retrying with error feedback...\n")
+                                print(f"Error details: {previous_error}")
+                            else:
+                                print(f"❌ Reached maximum retry limit ({max_retries + 1} attempts) for {element_name}. Moving to next element.")
+                                log_final_error(blender_response)
+
+                    except Exception as e:
+                        # Store the exception info for retry context
+                        previous_error = f"Exception occurred: {str(e)}"
+                        previous_code = generated_code if 'generated_code' in locals() else None
+                        
+                        retries += 1
+                        print(f"❌ Exception occurred for {element_name}: {str(e)}")
+                        if retries <= max_retries:
+                            print(f"Retrying with error context... Attempt {retries}/{max_retries + 1}\n")
+                        else:
+                            print(f"❌ Reached maximum retry limit due to exceptions for {element_name}. Moving to next element.")
+                            break
+                            
+            print(f"\n🎬 All {len(elements)} key elements processed.")
+        else:
+            print("❌ No Key Elements and Details section found in the response.")
+
+        enhancements = extract_final_enhancements_section(response.text)
+
+        enhancements_prompt = f"""
+        This is the description for the additional enhancements to be made for a scene.
+        The description of the enhancements: {enhancements}
+        # Give all the details, do not give anything other than the details, make sure you include numbers whenever necessary, so that it is easier to forward it to the coding agent.
+
+        the scene itself for context: {response.text} 
+        """
+        enhancements = describer.generate_content(enhancements_prompt)
+        
+        with open("enhancements.txt", "w") as f:
+            f.write(f"{enhancements.text}")
+        print("Got the setting description")
+        
+        enhancements = extract_sections_by_roman_numerals(enhancements.text)
+        print(f"Found {len(enhancements)} setting sections")
+
+        max_retries = 2
+        
+        # Get initial scene context (empty scene)
+        print("\n--- Getting initial scene context ---")
+        current_scene_context = get_scene_context()
+        print("Initial scene context retrieved")
+        
+        for i, scene in enumerate(enhancements.keys(), 1):
+            print(f"\n--- Processing Scene {i}/{len(enhancements)} ---")
+            scene_desc = enhancements[scene]
+            
+            print(scene_desc)
+            # Get current scene context before generating new elements
             print("Getting current scene context...")
             current_scene_context = get_scene_context()
-
-            element_prompt = f"""
-    Category: {category}
-    Element: {element_name}
-    Description: {description}
-
-    Generate Blender code to create this specific element within the overall scene context.
-    Consider the existing objects and position this element appropriately.
-    """
-
-            retries = 0
+            
+            retries = 0 
             previous_error = None
             previous_code = None
             
@@ -786,15 +906,12 @@ if __name__ == "__main__":
                 try:
                     # Prepare the prompt based on whether this is a retry
                     if retries == 0:
-                        # First attempt - use element description with context
-                        prompt = element_prompt
+                        # First attempt - use scene description with context
+                        prompt = scene_desc
                     else:
                         # Retry attempt - include previous error and code for context
                         prompt = f"""
-                        Original element description:
-                        Category: {category}
-                        Element: {element_name}
-                        Description: {description}
+                        Original scene description: {scene_desc}
                         
                         Previous code that failed:
                         ```
@@ -805,17 +922,20 @@ if __name__ == "__main__":
                         {previous_error}
                         
                         Important: Do not use the attribute or method that caused the error mentioned above.
-                        Generate corrected code that avoids this specific error while still fulfilling the original element description.
+                        Generate corrected code that avoids this specific error while still fulfilling the original scene description.
                         """
                     
-                    # Generate code for this specific element with scene context
+                    # Generate code with scene context
                     generated_code = generate(coding_agent, prompt, current_scene_context)
                     generated_code = generated_code[10:-4]  # Trim the response as in original code
 
-                    print("Generated code for element:")
+                    print("Generated code:")
                     print(generated_code)
 
-                    print(f"\n--- Generated Blender Script for {element_name} ---")
+                    with open("scripts_og.txt", "w", encoding="utf-8") as f:
+                        f.write(generated_code)
+
+                    print("\n--- Generated Blender Script ---")
                     print("------------------------------\n")
 
                     # Send to Blender
@@ -829,7 +949,7 @@ if __name__ == "__main__":
                         is_successful = True
 
                     if is_successful:
-                        print(f"✅ {element_name} script executed successfully and completely in Blender!")
+                        print("✅ Script executed successfully and completely in Blender!")
                         # Update scene context after successful execution
                         current_scene_context = get_scene_context()
                         break  # Exit retry loop when successful
@@ -840,10 +960,10 @@ if __name__ == "__main__":
                         
                         retries += 1
                         if retries <= max_retries:
-                            print(f"❌ {element_name} script failed or was incomplete. Attempt {retries}/{max_retries + 1}. Retrying with error feedback...\n")
+                            print(f"❌ Script failed or was incomplete. Attempt {retries}/{max_retries + 1}. Retrying with error feedback...\n")
                             print(f"Error details: {previous_error}")
                         else:
-                            print(f"❌ Reached maximum retry limit ({max_retries + 1} attempts) for {element_name}. Moving to next element.")
+                            print(f"❌ Reached maximum retry limit ({max_retries + 1} attempts). Moving to next scene description.")
                             log_final_error(blender_response)
 
                 except Exception as e:
@@ -852,145 +972,120 @@ if __name__ == "__main__":
                     previous_code = generated_code if 'generated_code' in locals() else None
                     
                     retries += 1
-                    print(f"❌ Exception occurred for {element_name}: {str(e)}")
+                    print(f"❌ Exception occurred: {str(e)}")
                     if retries <= max_retries:
                         print(f"Retrying with error context... Attempt {retries}/{max_retries + 1}\n")
                     else:
-                        print(f"❌ Reached maximum retry limit due to exceptions for {element_name}. Moving to next element.")
+                        print(f"❌ Reached maximum retry limit due to exceptions. Moving to next scene description.")
                         break
-                        
-        print(f"\n🎬 All {len(elements)} key elements processed.")
-    else:
-        print("❌ No Key Elements and Details section found in the response.")
 
-    enhancements = extract_final_enhancements_section(response.text)
+        print("\n🎬 All enhancements completed.")
 
-    enhancements_prompt = f"""
-    This is the description for the additional enhancements to be made for a scene.
-    The description of the enhancements: {enhancements}
-    # Give all the details, do not give anything other than the details, make sure you include numbers whenever necessary, so that it is easier to forward it to the coding agent.
+        custom_angles = [
+            ("front", (radians(90), 0, radians(0))),
+            ("back",  (radians(90), 0, radians(180))),
+            ("iso_left", (radians(60), 0, radians(-45))),
+            ("iso_right", (radians(60), 0, radians(45))),
+        ]
+        take_multiple_screenshots(output_dir="renders/scene", angles=custom_angles)
 
-    the scene itself for context: {response.text} 
-    """
-    enhancements = describer.generate_content(enhancements_prompt)
-    
-    with open("enhancements.txt", "w") as f:
-        f.write(f"{enhancements.text}")
-    print("Got the setting description")
-    
-    enhancements = extract_sections_by_roman_numerals(enhancements.text)
-    print(f"Found {len(enhancements)} setting sections")
+        review = review_scene_with_images(reviewer_agent, prompt, "renders/scene")
+        
+        with open("review.txt", "w") as review_file:
+            review_file.write(review.text)
+
+        print(type(review), review)
+
+        lines = review.strip().split('\n')
+
+        if "Yes" in lines[0]:
+            flag = False
+        else:
+            flag = True
+
+    effects_prompt = f"This is the description of blender scene: {response.text}. Based on it add some final effects to the scene."
+
+    current_scene_context = get_scene_context()
 
     max_retries = 2
-    
-    # Get initial scene context (empty scene)
-    print("\n--- Getting initial scene context ---")
-    current_scene_context = get_scene_context()
-    print("Initial scene context retrieved")
-    
-    for i, scene in enumerate(enhancements.keys(), 1):
-        print(f"\n--- Processing Scene {i}/{len(enhancements)} ---")
-        scene_desc = enhancements[scene]
-        
-        print(scene_desc)
-        # Get current scene context before generating new elements
-        print("Getting current scene context...")
-        current_scene_context = get_scene_context()
-        
-        retries = 0 
-        previous_error = None
-        previous_code = None
-        
-        while retries <= max_retries:
-            try:
-                # Prepare the prompt based on whether this is a retry
-                if retries == 0:
-                    # First attempt - use scene description with context
-                    prompt = scene_desc
-                else:
-                    # Retry attempt - include previous error and code for context
-                    prompt = f"""
-                    Original scene description: {scene_desc}
-                    
-                    Previous code that failed:
-                    ```
-                    {previous_code}
-                    ```
-                    
-                    Error received from Blender:
-                    {previous_error}
-                    
-                    Important: Do not use the attribute or method that caused the error mentioned above.
-                    Generate corrected code that avoids this specific error while still fulfilling the original scene description.
-                    """
+    retries = 0
+    previous_error = None
+    previous_code = None
+
+    while retries <= max_retries:
+        try:
+            # Prepare the prompt based on whether this is a retry
+            if retries == 0:
+                # First attempt - use scene description with context
+                prompt = scene_desc
+            else:
+                # Retry attempt - include previous error and code for context
+                prompt = f"""
+                Original scene description: {scene_desc}
                 
-                # Generate code with scene context
-                generated_code = generate(coding_agent, prompt, current_scene_context)
-                generated_code = generated_code[10:-4]  # Trim the response as in original code
+                Previous code that failed:
+                ```
+                {previous_code}
+                ```
+                
+                Error received from Blender:
+                {previous_error}
+                
+                Important: Do not use the attribute or method that caused the error mentioned above.
+                Generate corrected code that avoids this specific error while still fulfilling the original scene description.
+                Do not add any complex lightings, keep it simple.
+                """
+            
+            # Generate code with scene context
+            generated_code = generate(effects_agent, prompt, current_scene_context)
+            generated_code = generated_code[10:-4]  # Trim the response as in original code
 
-                print("Generated code:")
-                print(generated_code)
+            print("Generated code:")
+            print(generated_code)
 
-                with open("scripts_og.txt", "w", encoding="utf-8") as f:
-                    f.write(generated_code)
+            with open("effects_script.txt", "w", encoding="utf-8") as f:
+                f.write(generated_code)
 
-                print("\n--- Generated Blender Script ---")
-                print("------------------------------\n")
+            print("\n--- Generated Blender Script ---")
+            print("------------------------------\n")
 
-                # Send to Blender
-                blender_response = send_to_blender(generated_code)
-                print("Blender response:", blender_response)
+            # Send to Blender
+            blender_response = send_to_blender(generated_code)
+            print("Blender response:", blender_response)
 
-                # Check if successful
-                is_successful = False
+            # Check if successful
+            is_successful = False
 
-                if blender_response and blender_response.get("status") == "success":
-                    is_successful = True
+            if blender_response and blender_response.get("status") == "success":
+                is_successful = True
 
-                if is_successful:
-                    print("✅ Script executed successfully and completely in Blender!")
-                    # Update scene context after successful execution
-                    current_scene_context = get_scene_context()
-                    break  # Exit retry loop when successful
-                else:
-                    # Store the error and code for the next retry
-                    previous_error = get_error_details(blender_response)
-                    previous_code = generated_code
-                    
-                    retries += 1
-                    if retries <= max_retries:
-                        print(f"❌ Script failed or was incomplete. Attempt {retries}/{max_retries + 1}. Retrying with error feedback...\n")
-                        print(f"Error details: {previous_error}")
-                    else:
-                        print(f"❌ Reached maximum retry limit ({max_retries + 1} attempts). Moving to next scene description.")
-                        log_final_error(blender_response)
-
-            except Exception as e:
-                # Store the exception info for retry context
-                previous_error = f"Exception occurred: {str(e)}"
-                previous_code = generated_code if 'generated_code' in locals() else None
+            if is_successful:
+                print("✅ Script executed successfully and completely in Blender!")
+                # Update scene context after successful execution
+                current_scene_context = get_scene_context()
+                break  # Exit retry loop when successful
+            else:
+                # Store the error and code for the next retry
+                previous_error = get_error_details(blender_response)
+                previous_code = generated_code
                 
                 retries += 1
-                print(f"❌ Exception occurred: {str(e)}")
                 if retries <= max_retries:
-                    print(f"Retrying with error context... Attempt {retries}/{max_retries + 1}\n")
+                    print(f"❌ Script failed or was incomplete. Attempt {retries}/{max_retries + 1}. Retrying with error feedback...\n")
+                    print(f"Error details: {previous_error}")
                 else:
-                    print(f"❌ Reached maximum retry limit due to exceptions. Moving to next scene description.")
-                    break
+                    print(f"❌ Reached maximum retry limit ({max_retries + 1} attempts). Moving to next scene description.")
+                    log_final_error(blender_response)
 
-    print("\n🎬 All enhancements completed.")
-
-    custom_angles = [
-        ("front", (radians(90), 0, radians(0))),
-        ("back",  (radians(90), 0, radians(180))),
-        ("iso_left", (radians(60), 0, radians(-45))),
-        ("iso_right", (radians(60), 0, radians(45))),
-    ]
-    take_multiple_screenshots(output_dir="renders/scene", angles=custom_angles)
-
-    review = review_scene_with_images(reviewer_agent, response.text, "renders/scene")
-    
-    with open("review.txt", "w") as review_file:
-        review_file.write(review.text)
-
-    print(review)
+        except Exception as e:
+            # Store the exception info for retry context
+            previous_error = f"Exception occurred: {str(e)}"
+            previous_code = generated_code if 'generated_code' in locals() else None
+            
+            retries += 1
+            print(f"❌ Exception occurred: {str(e)}")
+            if retries <= max_retries:
+                print(f"Retrying with error context... Attempt {retries}/{max_retries + 1}\n")
+            else:
+                print(f"❌ Reached maximum retry limit due to exceptions. Moving to next scene description.")
+                break
